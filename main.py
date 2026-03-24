@@ -4,13 +4,15 @@
 
 Возможности:
 - Автоматическая очередь с учётом rate limit (25 сек)
-- Поддержка stream: True (SSE) — нужен для ChatboxAI
-- Фильтрация мусорных запросов (генерация названия чата)
+- Поддержка stream: True (SSE) — нужен для ChatboxAI и CCR
+- Умная генерация названий чатов (мгновенно, без API)
+- Поддержка мультимодального формата content (строка и массив)
 - Автоповтор при 429
 """
 
 import asyncio
 import json
+import re
 import time
 import uuid
 import logging
@@ -56,29 +58,73 @@ MAX_RETRIES = 3
 request_counter: int = 0
 
 
-# ====== ФИЛЬТРАЦИЯ МУСОРНЫХ ЗАПРОСОВ ======
+# ====== ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ CONTENT ======
+
+def extract_text_content(content) -> str:
+    """
+    Извлекает текст из поля content сообщения.
+
+    OpenAI API поддерживает два формата:
+    1. Строка: "Привет"
+    2. Массив: [{"type": "text", "text": "Привет"}, {"type": "image_url", ...}]
+
+    Некоторые клиенты (CCR) всегда отправляют массив.
+    Эта функция безопасно обрабатывает оба варианта.
+    """
+    if content is None:
+        return ""
+
+    # Формат 1: обычная строка
+    if isinstance(content, str):
+        return content
+
+    # Формат 2: массив объектов
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict):
+                # Берём только текстовые части, пропускаем картинки и прочее
+                if part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                # Иногда бывает просто массив строк
+                text_parts.append(part)
+        return "\n".join(text_parts)
+
+    # На всякий случай — приводим к строке
+    return str(content)
+
+
+# ====== ФИЛЬТРАЦИЯ И ГЕНЕРАЦИЯ НАЗВАНИЙ ЧАТОВ ======
 
 def is_title_generation_request(messages: list[dict]) -> bool:
     """
-    Определяет, является ли запрос попыткой ChatboxAI сгенерировать
-    название для чата. Такие запросы содержат характерную фразу.
-    
-    Эти запросы мусорные — они тратят rate limit,
-    а пользователь их даже не видит.
+    Определяет, является ли запрос попыткой клиента сгенерировать
+    название для чата. Такие запросы содержат характерные фразы.
+
+    Поддерживает ChatboxAI, CCR и другие клиенты.
     """
     if not messages:
         return False
 
-    # Проверяем последнее сообщение — именно в нём ChatboxAI пишет инструкцию
-    last_content = messages[-1].get("content", "").lower()
+    # Извлекаем текст безопасно — работает и со строкой, и с массивом
+    last_content = extract_text_content(messages[-1].get("content", "")).lower()
 
-    # Характерные фразы из запроса ChatboxAI на генерацию названия
+    # Характерные фразы из запросов разных клиентов
     title_markers = [
+        # ChatboxAI
         "give this conversation a name",
         "give a short name",
         "name this conversation",
         "conversation a name",
         "provide the name, nothing else",
+        # CCR
+        "create a concise title",
+        "short title",
+        "title for this chat",
+        # Общие
+        "summarize this conversation",
+        "generate a title",
     ]
 
     for marker in title_markers:
@@ -88,34 +134,140 @@ def is_title_generation_request(messages: list[dict]) -> bool:
     return False
 
 
-def generate_fake_title(messages: list[dict]) -> str:
+def generate_smart_title(messages: list[dict]) -> str:
     """
-    Генерирует название чата локально, без обращения к ApiFreeLLM.
-    Берём первое сообщение пользователя и обрезаем до нескольких слов.
-    """
-    # Ищем текст пользователя внутри запроса на генерацию названия
-    last_content = messages[-1].get("content", "")
+    Генерирует осмысленное название чата локально, без API.
+    Мгновенно, не тратит rate limit.
 
-    # ChatboxAI присылает историю внутри блока ``` ... ```
-    # Пытаемся достать оттуда первое сообщение пользователя
-    lines = last_content.split("\n")
-    user_text = ""
+    Стратегия:
+    1. Ищем текст пользователя из блока ``` ... ``` (ChatboxAI формат)
+    2. Ищем первое сообщение пользователя в массиве messages
+    3. Берём текст ответа ассистента как fallback
+    4. Если ничего не нашли — "Новый чат"
+    """
+    last_content = extract_text_content(messages[-1].get("content", ""))
+
+    # --- Стратегия 1: достаём текст из блока ``` ... ``` ---
+    user_text = _extract_from_code_block(last_content)
+    if user_text:
+        return _trim_title(user_text)
+
+    # --- Стратегия 2: ищем сообщения пользователя в массиве messages ---
+    for msg in messages:
+        role = msg.get("role", "")
+        content = extract_text_content(msg.get("content", ""))
+
+        # Пропускаем системные сообщения и сам запрос на генерацию названия
+        if role == "user" and content and not _is_title_instruction(content):
+            return _trim_title(content)
+
+    # --- Стратегия 3: берём текст ответа ассистента ---
+    for msg in messages:
+        role = msg.get("role", "")
+        content = extract_text_content(msg.get("content", ""))
+
+        if role == "assistant" and content:
+            return _trim_title(content)
+
+    return "Новый чат"
+
+
+def _extract_from_code_block(text: str) -> str:
+    """
+    Достаёт первое сообщение пользователя из блока кода.
+    ChatboxAI присылает историю в формате:
+    ```
+    Привет
+    ---------
+    Ответ модели
+    ```
+    """
+    code_blocks = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
+
+    if not code_blocks:
+        return ""
+
+    # Берём первый блок и первую непустую строку
+    block = code_blocks[0]
+    lines = block.strip().split("\n")
 
     for line in lines:
         stripped = line.strip()
-        # Пропускаем служебные строки
-        if stripped and not stripped.startswith("```") and not stripped.startswith("-"):
-            # Пропускаем саму инструкцию ChatboxAI (на английском)
-            if "conversation" not in stripped.lower() and "name" not in stripped.lower():
-                user_text = stripped
-                break
+        # Пропускаем разделители и пустые строки
+        if stripped and not stripped.startswith("-") and len(stripped) > 1:
+            return stripped
 
-    if not user_text:
+    return ""
+
+
+def _is_title_instruction(text: str) -> bool:
+    """Проверяет, является ли текст инструкцией для генерации названия."""
+    lower = text.lower()
+    instruction_markers = [
+        "give this conversation a name",
+        "name this conversation",
+        "create a concise title",
+        "generate a title",
+        "provide the name",
+        "short title",
+        "keep it short",
+    ]
+    return any(marker in lower for marker in instruction_markers)
+
+
+def _trim_title(text: str) -> str:
+    """
+    Обрезает текст до красивого названия чата.
+    - Максимум 6 слов
+    - Убирает Markdown форматирование
+    - Убирает кавычки и префиксы
+    """
+    # Берём только первую строку
+    first_line = text.strip().split("\n")[0].strip()
+
+    # Убираем Markdown форматирование
+    first_line = re.sub(r"[*_`#]", "", first_line)
+
+    # Убираем обычные кавычки по краям
+    quote_chars = "\"'`"
+    first_line = first_line.strip(quote_chars)
+
+    # Убираем юникодные кавычки отдельно
+    unicode_quotes = [
+        "\u00ab",  # «
+        "\u00bb",  # »
+        "\u201e",  # „
+        "\u201c",  # "
+        "\u201d",  # "
+        "\u2018",  # '
+        "\u2019",  # '
+    ]
+    for char in unicode_quotes:
+        first_line = first_line.strip(char)
+
+    # Убираем префиксы ролей если есть
+    role_prefixes = ["User:", "user:", "Human:", "human:"]
+    for prefix in role_prefixes:
+        if first_line.startswith(prefix):
+            first_line = first_line[len(prefix):].strip()
+
+    # Обрезаем до 6 слов
+    words = first_line.split()
+
+    if len(words) <= 6:
+        title = " ".join(words)
+    else:
+        title = " ".join(words[:6]) + "..."
+
+    # Если слишком коротко или пусто
+    if len(title) < 2:
         return "Новый чат"
 
-    # Обрезаем до 5 слов
-    words = user_text.split()[:5]
-    return " ".join(words)
+    # Ограничиваем длину в символах
+    if len(title) > 50:
+        title = title[:47] + "..."
+
+    return title
 
 
 # ====== СТРИМИНГ (SSE) ======
@@ -123,8 +275,8 @@ def generate_fake_title(messages: list[dict]) -> str:
 def create_stream_chunk(content: str, model: str, finish_reason: str = None) -> str:
     """
     Формирует один чанк SSE-ответа в формате OpenAI.
-    
-    ChatboxAI ожидает именно такой формат — без него
+
+    ChatboxAI и CCR ожидают именно такой формат — без него
     клиент не может прочитать ответ модели.
     """
     chunk = {
@@ -141,10 +293,9 @@ def create_stream_chunk(content: str, model: str, finish_reason: str = None) -> 
         ],
     }
 
-    # Первый чанк содержит роль, последний — finish_reason, промежуточные — контент
     if finish_reason is None:
         chunk["choices"][0]["delta"] = {"content": content}
-    
+
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
@@ -152,9 +303,6 @@ async def stream_response(text: str, model: str):
     """
     Генератор SSE-ответа — отдаёт текст по частям,
     имитируя стриминг как у OpenAI.
-    
-    Разбиваем на небольшие куски чтобы ChatboxAI
-    показывал текст постепенно.
     """
     # Первый чанк — роль ассистента
     first_chunk = {
@@ -172,18 +320,17 @@ async def stream_response(text: str, model: str):
     }
     yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
-    # Разбиваем текст на куски по ~5 символов (имитация стриминга)
+    # Разбиваем текст на куски по ~5 символов
     chunk_size = 5
     for i in range(0, len(text), chunk_size):
         piece = text[i:i + chunk_size]
         yield create_stream_chunk(piece, model)
-        # Маленькая пауза — чтобы ChatboxAI успевал отрисовывать
         await asyncio.sleep(0.02)
 
-    # Финальный чанк — сигнал что генерация завершена
+    # Финальный чанк
     yield create_stream_chunk("", model, finish_reason="stop")
 
-    # Маркер конца потока — стандарт OpenAI SSE
+    # Маркер конца потока
     yield "data: [DONE]\n\n"
 
 
@@ -313,6 +460,7 @@ async def on_startup():
     logger.info("Rate limit: 1 запрос / %d сек", RATE_LIMIT_INTERVAL)
     logger.info("Фильтрация мусорных запросов: ВКЛ")
     logger.info("Поддержка стриминга (SSE): ВКЛ")
+    logger.info("Совместимость с CCR: ВКЛ")
     logger.info("Документация: http://localhost:%d/docs", SERVER_PORT)
     logger.info("=" * 50)
 
@@ -331,7 +479,8 @@ def build_prompt_from_messages(messages: list[dict]) -> str:
     parts = []
     for msg in messages:
         role = msg.get("role", "user")
-        content = msg.get("content", "")
+        # Используем безопасное извлечение — работает и со строкой, и с массивом
+        content = extract_text_content(msg.get("content", ""))
         label = role_labels.get(role, role.capitalize())
         parts.append(f"{label}: {content}")
 
@@ -361,16 +510,15 @@ async def proxy_chat(request: Request):
     model = data.get("model", DEFAULT_MODEL)
     use_stream = data.get("stream", False)
 
-    # --- Фильтруем мусорные запросы ---
+    # --- Генерация названия чата (мгновенно, без API) ---
     if is_title_generation_request(messages):
-        title = generate_fake_title(messages)
+        title = generate_smart_title(messages)
         logger.info(
-            "[#%d] Запрос на название чата — отвечаю локально: '%s'",
+            "[#%d] Название чата -> '%s'",
             req_id,
             title,
         )
 
-        # Отдаём название без обращения к ApiFreeLLM
         if use_stream:
             return StreamingResponse(
                 stream_response(title, model),
@@ -402,7 +550,6 @@ async def proxy_chat(request: Request):
 
     logger.info("[#%d] Ответ отправлен клиенту.", req_id)
 
-    # --- Стриминговый или обычный ответ ---
     if use_stream:
         return StreamingResponse(
             stream_response(result["text"], model),
@@ -423,6 +570,7 @@ async def proxy_chat(request: Request):
         })
 
 
+# Запасной маршрут — некоторые клиенты шлют прямо на /v1
 @app.post("/v1")
 async def proxy_chat_alt(request: Request):
     return await proxy_chat(request)
