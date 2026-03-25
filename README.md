@@ -28,7 +28,7 @@
 - **Кроссплатформенность** — поддержка Windows, macOS и Linux
 - **Безопасность** — валидация запросов и фильтрация мусорных данных
 
-## 📦 Установка
+## 📦 Запуск из исходников
 
 ### Предварительные требования
 - Python 3.8 или выше
@@ -241,16 +241,6 @@ FreeAPILLMRouter/
 Поддерживает различные форматы контента:
 - **Строка**: `"Привет, мир!"`
 - **Массив**: `[{"type": "text", "text": "Привет"}, {"type": "image_url", {"url": "..."}}]`
-
-## 🤝 Вклад в проект
-
-Мы приветствуем вклад в развитие проекта!
-
-1. Fork репозиторий
-2. Создайте feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit изменения (`git commit -m 'Add some AmazingFeature'`)
-4. Push в branch (`git push origin feature/AmazingFeature`)
-5. Откройте Pull Request
 
 ## 📄 Лицензия
 
